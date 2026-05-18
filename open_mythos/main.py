@@ -1,9 +1,11 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 try:
     from flash_attn import flash_attn_func
@@ -71,6 +73,10 @@ class MythosConfig:
     expert_dim: int = 512  # fine-grained: dim // (n_experts // n_experts_per_tok)
     # ACT halting
     act_threshold: float = 0.99
+    # ACT ponder cost: weight on the expected-loop-count regularizer added to
+    # the training loss. Pressures the halting unit to exit early rather than
+    # always running every loop. Sensitive — too high collapses to 1 loop.
+    act_ponder_coeff: float = 1e-3
     # RoPE
     rope_theta: float = 500000.0
     # LoRA depth adaptation
@@ -79,6 +85,19 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # MoE aux-loss-free load balancing: per-step router-bias nudge size
+    # (DeepSeek-V3 scheme; set 0.0 to disable load balancing entirely)
+    bias_update_rate: float = 1e-3
+    # Loop-index embedding (encodes recurrence depth into the recurrent block)
+    loop_embed_mode: str = "rope"  # "rope" (rotary over depth) | "additive"
+    loop_embed_dim: int = 0  # channels carrying the depth signal (0 → dim // 4)
+    loop_rope_theta: float = 10000.0  # base frequency for the depth sinusoids
+    # Router z-loss coefficient (ST-MoE): penalises large router logits for
+    # numerical stability. 0.0 disables it.
+    router_zloss_coeff: float = 1e-3
+    # Gradient (activation) checkpointing of the recurrent loop. Trades a
+    # recompute for a ~T× reduction in activation memory; training only.
+    grad_checkpoint: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -125,48 +144,54 @@ def precompute_rope_freqs(
     dim: int, max_len: int, theta: float = 500000.0
 ) -> torch.Tensor:
     """
-    Precompute complex-valued RoPE rotation matrices for positions 0..max_len-1.
+    Precompute RoPE rotation factors for positions 0..max_len-1.
 
-    Each position gets a complex phasor e^{i·m·θ_k} for each frequency pair k.
-    Stored as a complex tensor so that rotation is a single pointwise multiply.
+    Each (position m, frequency pair k) gets a rotation angle m·θ_k; the cosine
+    and sine of that angle are stored so the rotation is a real-valued pointwise
+    operation. An equivalent complex-phasor form (e^{i·m·θ_k}) is more compact
+    but `torch.compile`/Inductor cannot codegen complex ops — the real form
+    keeps RoPE inside the compiled graph and casts cleanly under mixed
+    precision. The rotation applied is identical (adjacent-pair convention).
 
     Args:
-        dim     -- head dimension (must be even); frequencies are computed for dim//2 pairs
+        dim     -- head dimension (must be even); angles are computed for dim//2 pairs
         max_len -- maximum sequence length to precompute
         theta   -- RoPE base (higher = slower frequency decay; 500k is the LLaMA-3 default)
 
     Returns:
-        complex64 tensor of shape (max_len, dim//2)
+        float32 tensor of shape (max_len, dim//2, 2); [..., 0] = cos, [..., 1] = sin
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     t = torch.arange(max_len, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    angles = torch.outer(t, inv_freq)  # (max_len, dim//2)
+    return torch.stack([angles.cos(), angles.sin()], dim=-1)
 
 
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
     Apply rotary positional embeddings to query or key tensors.
 
-    Interprets each pair of adjacent features as a 2D complex number and
-    multiplies by the precomputed phasor for that position, rotating the
-    representation in the complex plane without changing its norm.
+    Treats each pair of adjacent features (x₂ₖ, x₂ₖ₊₁) as a 2-D vector and
+    rotates it by the position-dependent angle via the 2-D rotation matrix
+    [[cos, -sin], [sin, cos]] — norm-preserving, and identical to multiplying
+    by the complex phasor e^{i·m·θ_k}, just written without complex tensors.
 
     Args:
         x         -- tensor of shape (B, T, H, head_dim); head_dim must be even
-        freqs_cis -- precomputed complex frequencies of shape (T, head_dim//2),
-                     already sliced to exactly the positions being processed
-                     (caller is responsible for correct start_pos offset)
+        freqs_cis -- precomputed cos/sin of shape (T, head_dim//2, 2), already
+                     sliced to exactly the positions being processed (caller is
+                     responsible for the correct start_pos offset)
 
     Returns:
         Rotated tensor of the same shape and dtype as x
     """
-    xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return (
-        torch.view_as_real(xc * freqs_cis.unsqueeze(0).unsqueeze(2))
-        .flatten(-2)
-        .to(x.dtype)
-    )
+    x_pairs = x.float().reshape(*x.shape[:-1], -1, 2)  # (B, T, H, head_dim//2, 2)
+    x0 = x_pairs[..., 0]
+    x1 = x_pairs[..., 1]
+    cos = freqs_cis[..., 0].unsqueeze(0).unsqueeze(2)  # (1, T, 1, head_dim//2)
+    sin = freqs_cis[..., 1].unsqueeze(0).unsqueeze(2)
+    rotated = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1)
+    return rotated.flatten(-2).to(x.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -257,20 +282,21 @@ class GQAttention(nn.Module):
             )
             out = out.to(orig_dtype).contiguous().view(B, T, -1)
         else:
-            # Fallback: manual scaled dot-product with explicit KV head expansion.
-            k = k.repeat_interleave(self.groups, dim=2)
-            v = v.repeat_interleave(self.groups, dim=2)
-            q = q.transpose(1, 2)  # (B, H, T, head_dim)
-            k = k.transpose(1, 2)
+            # Fallback when flash-attn is unavailable: PyTorch SDPA still
+            # dispatches to a fused (mem-efficient / cuDNN) kernel. enable_gqa
+            # handles the KV-head sharing, so no expanded heads are
+            # materialized; is_causal replaces the additive mask.
+            q = q.transpose(1, 2)  # (B, Hq, T, head_dim)
+            k = k.transpose(1, 2)  # (B, Hkv, S, head_dim)
             v = v.transpose(1, 2)
-            scale = self.head_dim**-0.5
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            if mask is not None:
-                attn = attn + mask
-            attn = F.dropout(
-                F.softmax(attn, dim=-1), p=self.dropout_p, training=self.training
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=(mask is not None),
+                dropout_p=self.dropout_p if self.training else 0.0,
+                enable_gqa=True,
             )
-            out = torch.matmul(attn, v)
             out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.wo(out)
@@ -345,7 +371,7 @@ class MLAttention(nn.Module):
         )
 
         self.wo = nn.Linear(cfg.n_heads * cfg.v_head_dim, cfg.dim, bias=False)
-        self.attn_drop = nn.Dropout(cfg.dropout)
+        self.dropout_p = cfg.dropout
 
     def forward(
         self,
@@ -403,17 +429,23 @@ class MLAttention(nn.Module):
         v = kv[..., self.qk_nope_dim :]  # (B, S, H, v_dim)
         k = torch.cat([k_nope, k_rope], dim=-1)  # (B, S, H, nope+rope)
 
-        # attention
+        # attention via fused SDPA — dispatches to a memory-efficient / cuDNN
+        # kernel instead of a materialized (B,H,T,S) score matrix. The query
+        # head dim (nope+rope) differs from the value head dim, which the
+        # math/mem-efficient backends support. is_causal replaces the additive
+        # mask: True for prefill/training (square), False for single-token
+        # decode where the new token attends the whole cached sequence.
         q = q.transpose(1, 2)  # (B, H, T, q_head_dim)
         k = k.transpose(1, 2)  # (B, H, S, q_head_dim)
-        v = v.transpose(1, 2)  # (B, H, S, v_dim)
-
-        scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        v = v.transpose(1, 2)  # (B, H, S, v_head_dim)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=(mask is not None),
+            dropout_p=self.dropout_p if self.training else 0.0,
+            scale=self.q_head_dim**-0.5,
+        )  # (B, H, T, v_head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -453,6 +485,38 @@ class Expert(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
+def _grouped_expert_mm(
+    a: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    """
+    Per-group matrix multiply for MoE expert dispatch.
+
+    `a` is the token-feature matrix (M, K) with rows already sorted so the
+    tokens routed to expert g form one contiguous block; `weight` is the
+    stacked expert weights (n_experts, K, N); `offsets` is the int32 cumulative
+    row-end of each block. Returns (M, N) where row m is `a[m] @ weight[g(m)]`.
+
+    On CUDA this is a single fused `torch._grouped_mm` call — one grouped-GEMM
+    kernel covering every expert at once — run in bfloat16, as expert matmuls
+    normally are. Off CUDA (CPU tests, fp32) it falls back to a per-expert loop.
+    """
+    if a.is_cuda:
+        out = torch._grouped_mm(
+            a.to(torch.bfloat16).contiguous(),
+            weight.to(torch.bfloat16),
+            offs=offsets,
+        )
+        return out.to(a.dtype)
+    out = a.new_zeros(a.shape[0], weight.shape[-1])
+    start = 0
+    for g in range(weight.shape[0]):
+        end = int(offsets[g])
+        if end > start:
+            out[start:end] = a[start:end] @ weight[g]
+        start = end
+    return out
+
+
 class MoEFFN(nn.Module):
     """
     Fine-grained Mixture-of-Experts FFN (DeepSeekMoE, Dai et al., 2024).
@@ -479,14 +543,33 @@ class MoEFFN(nn.Module):
         self.n_experts = cfg.n_experts
         self.n_shared = cfg.n_shared_experts
         self.topk = cfg.n_experts_per_tok
+        self.bias_update_rate = cfg.bias_update_rate
+        self.zloss_coeff = cfg.router_zloss_coeff
 
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
-        # load-balancing bias adjusted externally during training; not a gradient param
+        # Load-balancing bias for routing (DeepSeek-V3 aux-loss-free scheme).
+        # Shifts only which experts are selected, never the gate weights, so it
+        # stays out of the gradient. Stepped once per optimizer step via
+        # update_router_bias() — deliberately not inside forward(), so gradient
+        # checkpointing's recompute pass cannot double-apply it.
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+        # Per-expert token counts from the most recent forward (consumed by the
+        # bias step) and the router z-loss from the most recent training
+        # forward (collected by RecurrentBlock). Plain attributes, not persisted.
+        self._last_counts: Optional[torch.Tensor] = None
+        self._zloss: Optional[torch.Tensor] = None
 
-        self.routed_experts = nn.ModuleList(
-            [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
-        )
+        # Routed experts as stacked weight tensors (not a ModuleList of Expert
+        # modules) so the whole top-K dispatch is three grouped-GEMM calls
+        # rather than one matmul per expert. Each expert is a SwiGLU FFN:
+        # down( silu(x @ gate) * (x @ up) ). Initialised here because the
+        # model-level N(0,0.02) pass only touches nn.Linear / nn.Embedding.
+        self.gate_w = nn.Parameter(torch.empty(cfg.n_experts, cfg.dim, cfg.expert_dim))
+        self.up_w = nn.Parameter(torch.empty(cfg.n_experts, cfg.dim, cfg.expert_dim))
+        self.down_w = nn.Parameter(torch.empty(cfg.n_experts, cfg.expert_dim, cfg.dim))
+        for w in (self.gate_w, self.up_w, self.down_w):
+            nn.init.normal_(w, std=0.02)
+
         self.shared_experts = nn.ModuleList(
             [
                 Expert(cfg.dim, cfg.expert_dim * cfg.n_experts_per_tok)
@@ -515,22 +598,73 @@ class MoEFFN(nn.Module):
         topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
-        # routed expert dispatch (token-level scatter)
-        out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        # Per-expert token counts — drive both the load-balancing step and the
+        # grouped-GEMM group offsets below.
+        counts = torch.bincount(topk_idx.reshape(-1), minlength=self.n_experts)
+
+        # Record load for the load-balancing step, applied later by
+        # update_router_bias(). Overwrite (not accumulate) so a gradient-
+        # checkpointing recompute leaves the same value rather than doubling it.
+        with torch.no_grad():
+            self._last_counts = counts.to(self.router_bias.dtype)
+
+        # Router z-loss (ST-MoE): penalise large router logits for numerical
+        # stability. Differentiable through the router weight; stashed here and
+        # collected by RecurrentBlock. Computed only while training.
+        if self.training:
+            lse = torch.logsumexp(logits, dim=-1)  # (B*T,)
+            self._zloss = self.zloss_coeff * lse.pow(2).mean()
+        else:
+            self._zloss = None
+
+        # Routed dispatch: sort the (token, expert) pairs by expert so every
+        # expert's tokens form a contiguous block, run all experts as three
+        # grouped GEMMs (gate, up, down), then scatter the gate-weighted
+        # results back, summing each token's top-K expert contributions.
+        n_tok = flat.shape[0]
+        expert_of = topk_idx.reshape(-1)  # (n_tok*topk,)
+        token_of = torch.arange(
+            n_tok, device=flat.device
+        ).repeat_interleave(self.topk)
+        order = torch.argsort(expert_of)
+        sorted_tokens = token_of[order]
+        x_sorted = flat[sorted_tokens]  # (n_tok*topk, dim), grouped by expert
+        offsets = counts.cumsum(0).to(torch.int32)
+
+        g = _grouped_expert_mm(x_sorted, self.gate_w, offsets)
+        u = _grouped_expert_mm(x_sorted, self.up_w, offsets)
+        y = _grouped_expert_mm(F.silu(g) * u, self.down_w, offsets)
+        y = y * topk_scores.reshape(-1)[order].unsqueeze(-1)  # apply gate weights
+
+        out = torch.zeros_like(flat).index_add(0, sorted_tokens, y)
 
         # shared experts always fire for every token
         for shared in self.shared_experts:
             out = out + shared(flat)
 
         return out.view(B, T, D)
+
+    def update_router_bias(self) -> None:
+        """
+        Apply one aux-loss-free load-balancing step to the routing bias.
+
+        Uses the per-expert token counts recorded by the most recent forward
+        (DeepSeek-V3): underloaded experts (count below the mean) are nudged
+        up, overloaded ones down, by a fixed step. No gradient is involved.
+
+        Call once per optimizer step from the training loop — not from
+        forward() — so a gradient-checkpointing recompute cannot double-apply
+        it. Under distributed training the counts are summed across ranks
+        first, so every rank derives the identical update and the replicated
+        router_bias buffers stay in sync.
+        """
+        if self.bias_update_rate <= 0.0 or self._last_counts is None:
+            return
+        counts = self._last_counts
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(counts)  # sum expert load across ranks
+        err = counts.mean() - counts  # > 0 ⇒ expert underloaded
+        self.router_bias.add_(self.bias_update_rate * torch.sign(err))
 
 
 # ---------------------------------------------------------------------------
@@ -539,35 +673,84 @@ class MoEFFN(nn.Module):
 
 
 def loop_index_embedding(
-    h: torch.Tensor, loop_t: int, loop_dim: int, theta: float = 10000.0
+    h: torch.Tensor,
+    loop_t: int,
+    loop_dim: int,
+    theta: float = 10000.0,
+    mode: str = "rope",
 ) -> torch.Tensor:
     """
-    Inject a sinusoidal loop-index signal into the first loop_dim channels of h.
+    Encode the recurrent loop index into the hidden state.
 
-    Analogous to RoPE for sequence position, but applied over recurrence depth
-    instead of token position. Without this, the shared recurrent block weights
-    must handle both early-stage pattern-matching and late-stage refinement with
-    no signal distinguishing which loop they are on. Adding the loop index lets
-    the same parameters implement functionally distinct operations per iteration.
+    The shared recurrent-block weights process every loop iteration; without a
+    depth signal the same parameters must handle early-stage pattern-matching
+    and late-stage refinement with nothing telling them which loop they are on.
+    This encodes the loop index so the block can implement functionally
+    distinct operations per iteration — the recurrence-depth analogue of RoPE
+    over sequence position.
+
+    Two modes:
+
+      "rope"     -- Rotary embedding over depth. Adjacent channel pairs in the
+                    first ``loop_dim`` channels are rotated by ``loop_t · freq_k``,
+                    exactly as RoPE rotates by sequence position. The rotation
+                    is applied to the residual stream ``h`` rather than to
+                    attention Q/K: a rotation shared by Q and K of the same
+                    loop cancels inside the q·kᵀ dot product, so depth must be
+                    injected somewhere the block reads it through its learned
+                    projections. Norm-preserving (a rotation), so it does not
+                    perturb the downstream RMSNorm scale. ``loop_t = 0`` is the
+                    identity rotation.
+
+      "additive" -- Fixed sinusoidal vector added to the first ``loop_dim``
+                    channels (the Universal Transformer timestep embedding,
+                    Dehghani et al. 2018). Retained as an ablation baseline
+                    against the rotary mode.
+
+    Channels beyond ``loop_dim`` are left untouched in both modes, leaving a
+    depth-invariant subspace (decoupled-RoPE design, as in DeepSeek-V2 MLA).
 
     Args:
         h        -- hidden state tensor of shape (B, T, dim)
         loop_t   -- current loop iteration index (0-based)
-        loop_dim -- number of leading channels to receive the embedding (must be even)
-        theta    -- sinusoidal base frequency
+        loop_dim -- number of leading channels carrying the embedding (must be even)
+        theta    -- base frequency for the depth sinusoids
+        mode     -- "rope" (default) or "additive"
 
     Returns:
-        h with a sinusoidal bias added to its first loop_dim channels; same shape
+        h with the loop index encoded into its first loop_dim channels; same shape.
     """
+    if loop_dim <= 0:
+        return h
+
+    device, dtype = h.device, h.dtype
+    half = loop_dim // 2
     freqs = 1.0 / (
         theta
-        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=h.dtype) / loop_dim)
+        ** (torch.arange(0, loop_dim, 2, device=device, dtype=torch.float32) / loop_dim)
     )
-    angles = loop_t * freqs  # (loop_dim//2,)
-    emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:loop_dim]
-    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=h.dtype)
-    emb_full[:loop_dim] = emb
-    return h + emb_full.unsqueeze(0).unsqueeze(0)
+    angles = loop_t * freqs  # (half,)
+
+    if mode == "additive":
+        emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:loop_dim].to(dtype)
+        pad = torch.zeros(h.shape[-1] - loop_dim, device=device, dtype=dtype)
+        return h + torch.cat([emb, pad]).unsqueeze(0).unsqueeze(0)
+
+    if mode != "rope":
+        raise ValueError(
+            f"loop_index_embedding: unknown mode {mode!r} (expected 'rope' or 'additive')"
+        )
+
+    # Rotary: rotate each adjacent channel pair (x1, x2) of the first loop_dim
+    # channels by the depth-dependent angle, leaving the rest of h unchanged.
+    cos = angles.cos().to(dtype)  # (half,)
+    sin = angles.sin().to(dtype)
+    rot = h[..., :loop_dim]
+    pairs = rot.reshape(*rot.shape[:-1], half, 2)
+    x1, x2 = pairs[..., 0], pairs[..., 1]
+    rotated = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    rotated = rotated.reshape(rot.shape)
+    return torch.cat([rotated, h[..., loop_dim:]], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -790,7 +973,7 @@ class RecurrentBlock(nn.Module):
     The core recurrent block of OpenMythos — a single TransformerBlock looped T times.
 
     At each loop iteration t, the hidden state h is updated via:
-        1. loop_index_embedding: inject sinusoidal loop-index signal into h
+        1. loop_index_embedding: encode the loop index into h (rotary over depth)
         2. TransformerBlock:     compute attention + MoE FFN on normalized (h + e)
         3. LoRAAdapter:          apply depth-wise LoRA delta to transformer output
         4. LTIInjection:         stable update h = A·h + B·e + transformer_out
@@ -809,7 +992,8 @@ class RecurrentBlock(nn.Module):
     def __init__(self, cfg: MythosConfig):
         """
         Args:
-            cfg -- MythosConfig; uses dim, lora_rank, max_loop_iters, act_threshold
+            cfg -- MythosConfig; uses dim, lora_rank, max_loop_iters, act_threshold,
+                   loop_embed_mode, loop_embed_dim, loop_rope_theta
         """
         super().__init__()
         self.cfg = cfg
@@ -818,9 +1002,32 @@ class RecurrentBlock(nn.Module):
         self.act = ACTHalting(cfg.dim)
         self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
         self.norm = RMSNorm(cfg.dim)
-        self.loop_dim = (
-            cfg.dim // 8
-        )  # fraction of channels receiving loop-index embedding
+
+        # Loop-index embedding: how many leading channels carry the depth
+        # signal (default dim // 4), forced even so the rotary mode can rotate
+        # adjacent channel pairs. The rest of h stays depth-invariant.
+        loop_dim = cfg.loop_embed_dim or (cfg.dim // 4)
+        self.loop_dim = (loop_dim // 2) * 2
+        self.loop_embed_mode = cfg.loop_embed_mode
+        self.loop_rope_theta = cfg.loop_rope_theta
+
+    def _block_step(
+        self,
+        combined: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        cache_key: str,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        One recurrent TransformerBlock call, returning (output, router z-loss).
+
+        Returning the z-loss explicitly (rather than reading it off the MoE
+        afterwards) keeps it a checkpoint *output*, so gradient checkpointing
+        reconnects it to the autograd graph on recompute. Used only on the
+        training path, where kv_cache is always None.
+        """
+        out = self.block(combined, freqs_cis, mask, None, cache_key)
+        return out, self.block.ffn._zloss
 
     def forward(
         self,
@@ -830,7 +1037,7 @@ class RecurrentBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Run the recurrent loop for up to n_loops iterations with ACT early exit.
 
@@ -845,7 +1052,10 @@ class RecurrentBlock(nn.Module):
                         each loop iteration uses a separate cache key
 
         Returns:
-            ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+            (h_out, aux) where h_out is the ACT-weighted sum of hidden states
+            across iterations, shape (B, T, dim), and aux is the training
+            regularizer — mean router z-loss plus the weighted ACT ponder
+            cost — a scalar tensor while training, None at inference.
         """
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
@@ -854,11 +1064,38 @@ class RecurrentBlock(nn.Module):
         cumulative_p = torch.zeros(B, T, device=h.device)
         h_out = torch.zeros_like(h)
 
+        # Activation checkpointing of the per-loop block trades a recompute for
+        # a ~T× cut in stored activations. Training only, and only without a KV
+        # cache — a checkpoint recompute would otherwise re-append cache entries.
+        use_ckpt = self.cfg.grad_checkpoint and self.training and kv_cache is None
+        aux_sum: Optional[torch.Tensor] = None
+        n_run = 0
+        # ACT ponder cost: Σ_t P(position still running entering step t) — the
+        # expected number of loop iterations. Minimising it pressures the
+        # halting unit toward earlier exit (Graves 2016 ponder cost).
+        ponder = torch.zeros((), device=h.device)
+
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
+            h_loop = loop_index_embedding(
+                h, t, self.loop_dim, self.loop_rope_theta, self.loop_embed_mode
+            )
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
-            trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+            if use_ckpt:
+                trans_out, zloss = checkpoint(
+                    self._block_step,
+                    combined,
+                    freqs_cis,
+                    mask,
+                    cache_key,
+                    use_reentrant=False,
+                )
+            else:
+                trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+                zloss = self.block.ffn._zloss
+            n_run += 1
+            if zloss is not None:
+                aux_sum = zloss if aux_sum is None else aux_sum + zloss
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
 
@@ -870,9 +1107,18 @@ class RecurrentBlock(nn.Module):
             # Gate by still_running so halted positions contribute exactly
             # once (on the halting step) and zero thereafter — otherwise
             # threshold<1 leaves a non-zero remainder that leaks every step.
+            #
+            # Force-halt on the final iteration: any position that never
+            # crossed the threshold within n_loops must still receive its
+            # leftover mass, otherwise its ACT weights sum to < 1 and the
+            # returned hidden state is magnitude-shrunk (Graves 2016 §3.1).
             remainder = (1.0 - cumulative_p).clamp(min=0)
+            # ponder cost: the mass still running entering this step (gradient
+            # flows to the halting unit, pushing cumulative_p up faster)
+            ponder = ponder + (remainder * still_running.float()).mean()
+            is_last = t == n_loops - 1
             weight = torch.where(
-                cumulative_p + p >= self.cfg.act_threshold,
+                (cumulative_p + p >= self.cfg.act_threshold) | is_last,
                 remainder,
                 p,
             )
@@ -888,7 +1134,12 @@ class RecurrentBlock(nn.Module):
             if halted.all() and kv_cache is None:
                 break
 
-        return h_out
+        # Aux training loss: mean router z-loss + weighted ACT ponder cost.
+        # None at inference, where no z-loss is collected.
+        aux = None
+        if aux_sum is not None:
+            aux = aux_sum / n_run + self.cfg.act_ponder_coeff * ponder
+        return h_out, aux
 
 
 # ---------------------------------------------------------------------------
@@ -958,12 +1209,35 @@ class OpenMythos(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialize all linear and embedding weights with N(0, 0.02)."""
+        """
+        Initialize weights with N(0, 0.02), then apply GPT-2 residual scaling.
+
+        Projections that write into the residual stream (attention output `wo`
+        and every SwiGLU expert's `down`) are downscaled by 1/sqrt(2 · depth)
+        so the residual variance does not grow with depth. The effective depth
+        counts the prelude layers, the recurrent block's loop iterations (one
+        set of weights run max_loop_iters times), and the coda layers; the
+        factor 2 accounts for the two residual writes per block (attention and
+        FFN). Without this, a model this deep — and looped — tends to diverge.
+        """
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
+
+        depth = self.cfg.prelude_layers + self.cfg.max_loop_iters + self.cfg.coda_layers
+        resid_scale = (2 * depth) ** -0.5
+        with torch.no_grad():
+            for m in self.modules():
+                if isinstance(m, (MLAttention, GQAttention)):
+                    m.wo.weight.mul_(resid_scale)
+                elif isinstance(m, Expert):
+                    # dense prelude/coda FFN and MoE shared experts
+                    m.down.weight.mul_(resid_scale)
+                elif isinstance(m, MoEFFN):
+                    # stacked routed-expert down projections
+                    m.down_w.mul_(resid_scale)
 
     @staticmethod
     def _causal_mask(
@@ -995,23 +1269,28 @@ class OpenMythos(nn.Module):
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
         start_pos: int = 0,
+        return_aux: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
 
         Args:
-            input_ids -- token indices of shape (B, T)
-            n_loops   -- recurrent loop depth; defaults to cfg.max_loop_iters.
-                         Increase at inference to extrapolate to harder problems.
-            kv_cache  -- dict mutated in-place for autoregressive KV caching;
-                         pass an empty dict {} and reuse across decode steps
-            start_pos -- index of the first token in input_ids within the full
-                         sequence; used to select the correct RoPE frequencies
-                         during incremental decoding (0 for prefill, prompt_len
-                         for each subsequent decode step)
+            input_ids  -- token indices of shape (B, T)
+            n_loops    -- recurrent loop depth; defaults to cfg.max_loop_iters.
+                          Increase at inference to extrapolate to harder problems.
+            kv_cache   -- dict mutated in-place for autoregressive KV caching;
+                          pass an empty dict {} and reuse across decode steps
+            start_pos  -- index of the first token in input_ids within the full
+                          sequence; used to select the correct RoPE frequencies
+                          during incremental decoding (0 for prefill, prompt_len
+                          for each subsequent decode step)
+            return_aux -- if True, also return the MoE router z-loss to add to
+                          the training objective. Default False, so generation
+                          and inference callers keep the plain-logits return.
 
         Returns:
-            Logits of shape (B, T, vocab_size)
+            Logits of shape (B, T, vocab_size). If return_aux is True, instead
+            returns (logits, aux) where aux is a scalar router-z-loss tensor.
         """
         T = input_ids.shape[1]
         device = input_ids.device
@@ -1026,12 +1305,17 @@ class OpenMythos(nn.Module):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
         e = x  # encoded input frozen for injection every loop
-        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        x, aux = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
 
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
 
-        return self.head(self.norm(x))
+        logits = self.head(self.norm(x))
+        if return_aux:
+            # aux is None at inference (z-loss is training-only); hand back a
+            # zero scalar so callers can unconditionally add it to the loss.
+            return logits, aux if aux is not None else logits.new_zeros(())
+        return logits
 
     @torch.no_grad()
     def generate(
@@ -1083,3 +1367,16 @@ class OpenMythos(nn.Module):
             next_tok = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_tok], dim=1)
         return input_ids
+
+    def step_router_bias(self) -> None:
+        """
+        Apply the aux-loss-free MoE load-balancing update to every router.
+
+        Call once per optimizer step from the training loop. Each MoE router's
+        bias is nudged from the expert load recorded on the most recent forward
+        (see MoEFFN.update_router_bias). Kept out of forward() so gradient
+        checkpointing's recompute pass cannot double-apply it.
+        """
+        for m in self.modules():
+            if isinstance(m, MoEFFN):
+                m.update_router_bias()

@@ -149,6 +149,43 @@ def get_lr(step: int, warmup: int, total: int, max_lr: float, min_lr: float) -> 
 
 
 # ---------------------------------------------------------------------------
+# Optimizer parameter groups
+# ---------------------------------------------------------------------------
+
+
+def build_param_groups(model, weight_decay: float) -> list[dict]:
+    """
+    Split parameters into weight-decay and no-weight-decay groups.
+
+    Standard LM-pretraining practice: decay only the ≥2-D matrices (linear and
+    embedding weights), and exempt every 1-D parameter — RMSNorm scales, biases,
+    and the LTI injection's stability parameters (`log_A`, `log_dt`, `B`).
+    Decaying those is actively harmful: it would, e.g., pull the recurrent
+    block's spectral parameters toward an unintended fixed point.
+
+    Requires the model to expose original (unflattened) parameters — under FSDP
+    that means wrapping with `use_orig_params=True`, otherwise every parameter
+    looks 1-D and the split collapses.
+
+    Args:
+        model        -- the (optionally FSDP-wrapped) model
+        weight_decay -- decay coefficient applied to the matrix group
+
+    Returns:
+        Two AdamW param-group dicts: decayed matrices, then undecayed 1-D params.
+    """
+    decay, no_decay = [], []
+    for _, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (decay if p.dim() >= 2 else no_decay).append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
 
@@ -384,6 +421,7 @@ def main():
     ckpt_every = 1000
     ckpt_dir = "checkpoints"
     dataset_subset = "sample-10BT"  # → sample-100BT or "default" for full run
+    compile_model = True  # torch.compile the model (set False to debug eager)
 
     if master:
         logger.info(
@@ -397,6 +435,9 @@ def main():
     cfg = mythos_3b()
     cfg.vocab_size = vocab_size
     cfg.max_seq_len = seq_len
+    # Checkpoint the recurrent loop — run max_loop_iters times, it otherwise
+    # dominates activation memory. Trades one recompute for a ~T× reduction.
+    cfg.grad_checkpoint = True
 
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
@@ -416,6 +457,9 @@ def main():
             mixed_precision=mp_policy,
             auto_wrap_policy=wrap_policy,
             device_id=local_rank,
+            # Keep original parameter shapes visible so build_param_groups can
+            # tell matrices from 1-D params for the weight-decay split.
+            use_orig_params=True,
         )
     else:
         model = model.to(device)
@@ -432,11 +476,21 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Parameters: {n_params:,}  |  AMP dtype: {amp_dtype}")
 
+    # torch.compile fuses pointwise ops and cuts Python/launch overhead. Applied
+    # after FSDP so the wrapped collectives are compiled too. Attribute access
+    # (.step_router_bias, .clip_grad_norm_, .parameters) transparently forwards
+    # through the returned OptimizedModule, and the autograd-checkpointed
+    # recurrent loop compiles with graph breaks rather than failing.
+    if compile_model:
+        model = torch.compile(model)
+        if master:
+            logger.info("Model compiled with torch.compile")
+
     # ------------------------------------------------------------------
     # Optimizer
     # ------------------------------------------------------------------
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=wd, betas=(0.9, 0.95), fused=True
+        build_param_groups(model, wd), lr=lr, betas=(0.9, 0.95), fused=True
     )
 
     # ------------------------------------------------------------------
@@ -496,11 +550,12 @@ def main():
                 else model.no_sync()
             )
             with sync, amp_ctx:
-                logits = model(x)
+                logits, aux = model(x, return_aux=True)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, vocab_size), y.view(-1)
                 )
-                loss = loss / grad_accum
+                # aux is the MoE router z-loss (already scaled by its coeff)
+                loss = (loss + aux) / grad_accum
 
             loss.backward()
             loss_accum += loss.item()
@@ -513,6 +568,9 @@ def main():
         else:
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        # Aux-loss-free MoE load balancing: nudge each router's bias from the
+        # expert load seen this step (counts are all-reduced across ranks).
+        model.step_router_bias()
         step += 1
 
         if master and step % log_every == 0:

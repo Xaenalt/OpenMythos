@@ -90,8 +90,8 @@ class TestRMSNorm:
 class TestRoPE:
     def test_precompute_shape(self):
         freqs = precompute_rope_freqs(dim=16, max_len=32)
-        assert freqs.shape == (32, 8)  # (max_len, dim//2)
-        assert freqs.is_complex()
+        assert freqs.shape == (32, 8, 2)  # (max_len, dim//2, [cos, sin])
+        assert freqs.dtype == torch.float32
 
     def test_apply_rope_shape(self):
         freqs = precompute_rope_freqs(dim=16, max_len=32)
@@ -124,26 +124,27 @@ class TestRoPEExtended:
 
     # --- precompute_rope_freqs ---
 
-    def test_position_zero_is_unit_phasor(self):
-        """freqs[0] must be all 1+0j (angle = 0 * freq = 0 for every pair)."""
+    def test_position_zero_has_zero_angle(self):
+        """freqs[0] is angle 0 for every pair: cos = 1, sin = 0."""
         freqs = precompute_rope_freqs(dim=16, max_len=8)
-        expected = torch.ones(8, dtype=torch.complex64)
-        assert torch.allclose(freqs[0], expected, atol=1e-6)
+        assert torch.allclose(freqs[0, :, 0], torch.ones(8), atol=1e-6)
+        assert torch.allclose(freqs[0, :, 1], torch.zeros(8), atol=1e-6)
 
-    def test_all_phasors_have_unit_magnitude(self):
-        """Every phasor magnitude must be 1 — RoPE is an isometric rotation."""
+    def test_rotation_factors_are_unit_norm(self):
+        """cos² + sin² must equal 1 — RoPE is an isometric rotation."""
         freqs = precompute_rope_freqs(dim=16, max_len=32)
-        assert torch.allclose(freqs.abs(), torch.ones_like(freqs.abs()), atol=1e-6)
+        mag = freqs[..., 0] ** 2 + freqs[..., 1] ** 2
+        assert torch.allclose(mag, torch.ones_like(mag), atol=1e-6)
 
     def test_angles_equal_outer_product(self):
-        """freqs[t, k].angle() must equal t × base_freq[k] for all t, k."""
+        """freqs[t, k] must be (cos, sin) of t × base_freq[k] for all t, k."""
         dim, max_len, theta = 8, 6, 500000.0
         freqs = precompute_rope_freqs(dim=dim, max_len=max_len, theta=theta)
         base = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         t = torch.arange(max_len, dtype=torch.float32)
-        expected = torch.polar(torch.ones(max_len, dim // 2), torch.outer(t, base))
-        assert torch.allclose(freqs.real, expected.real, atol=1e-6)
-        assert torch.allclose(freqs.imag, expected.imag, atol=1e-6)
+        angles = torch.outer(t, base)
+        assert torch.allclose(freqs[..., 0], angles.cos(), atol=1e-6)
+        assert torch.allclose(freqs[..., 1], angles.sin(), atol=1e-6)
 
     def test_higher_theta_produces_smaller_angles(self):
         """Larger theta → slower frequency decay → smaller rotation angle per step.
@@ -154,13 +155,15 @@ class TestRoPEExtended:
         dim, max_len = 16, 8
         freqs_fast = precompute_rope_freqs(dim=dim, max_len=max_len, theta=100.0)
         freqs_slow = precompute_rope_freqs(dim=dim, max_len=max_len, theta=500000.0)
-        assert (freqs_fast[1, 1:].angle().abs() > freqs_slow[1, 1:].angle().abs()).all()
+        ang_fast = torch.atan2(freqs_fast[1, 1:, 1], freqs_fast[1, 1:, 0]).abs()
+        ang_slow = torch.atan2(freqs_slow[1, 1:, 1], freqs_slow[1, 1:, 0]).abs()
+        assert (ang_fast > ang_slow).all()
 
     def test_default_theta_matches_explicit(self):
         """Omitting theta must equal passing theta=500000.0."""
         f1 = precompute_rope_freqs(16, 8)
         f2 = precompute_rope_freqs(16, 8, theta=500000.0)
-        assert torch.allclose(f1.real, f2.real) and torch.allclose(f1.imag, f2.imag)
+        assert torch.allclose(f1, f2)
 
     # --- apply_rope ---
 
@@ -182,14 +185,15 @@ class TestRoPEExtended:
         assert apply_rope(x, freqs[:4]).dtype == torch.float16
 
     def test_inverse_rotation_recovers_input(self):
-        """Rotating by freqs then by conj(freqs) (inverse) must recover the original."""
+        """Rotating by freqs then by the inverse rotation must recover the original."""
         dim = 16
         freqs = precompute_rope_freqs(dim=dim, max_len=8)
         x = torch.randn(2, 4, 3, dim)
         rotated = apply_rope(x, freqs[:4])
-        xc = torch.view_as_complex(rotated.float().reshape(*rotated.shape[:-1], -1, 2))
-        inv = freqs.conj()[:4].unsqueeze(0).unsqueeze(2)
-        recovered = torch.view_as_real(xc * inv).flatten(-2).to(x.dtype)
+        # inverse rotation: same cos, negated sin (rotate by -angle)
+        inv = freqs[:4].clone()
+        inv[..., 1] = -inv[..., 1]
+        recovered = apply_rope(rotated, inv)
         assert torch.allclose(x, recovered, atol=1e-5)
 
     def test_batch_independence(self):
@@ -366,10 +370,10 @@ class TestMoEFFN:
         assert "router_bias" not in param_names
 
     def test_shared_experts_always_fire(self):
-        # Zero out all routed experts; output should still be nonzero from shared
-        for exp in self.moe.routed_experts:
-            for p in exp.parameters():
-                p.data.zero_()
+        # Zero the routed experts' down projection so their contribution is 0;
+        # output must still be nonzero from the always-on shared experts.
+        with torch.no_grad():
+            self.moe.down_w.zero_()
         x = torch.randn(B, T, self.cfg.dim)
         out = self.moe(x)
         assert out.abs().sum() > 0
@@ -387,17 +391,41 @@ class TestLoopIndexEmbedding:
         assert out.shape == h.shape
 
     def test_different_iterations_differ(self):
-        h = torch.zeros(1, 1, 64)
+        # Rotary mode multiplies, so it must be probed with non-zero input
+        # (rotating zeros yields zeros). Distinct loop indices → distinct output.
+        h = torch.randn(1, 4, 64)
         out0 = loop_index_embedding(h, loop_t=0, loop_dim=8)
         out1 = loop_index_embedding(h, loop_t=1, loop_dim=8)
         assert not torch.allclose(out0, out1)
 
+    def test_loop_zero_is_identity(self):
+        # In rope mode, loop_t=0 is a zero-angle rotation — the identity.
+        h = torch.randn(1, 4, 64)
+        out = loop_index_embedding(h, loop_t=0, loop_dim=8)
+        assert torch.allclose(out, h, atol=1e-6)
+
+    def test_rope_preserves_norm(self):
+        # A rotation is norm-preserving on the channels it touches.
+        h = torch.randn(2, 4, 64)
+        out = loop_index_embedding(h, loop_t=5, loop_dim=16)
+        assert torch.allclose(
+            out[..., :16].norm(dim=-1), h[..., :16].norm(dim=-1), atol=1e-5
+        )
+
     def test_only_first_dims_modified(self):
-        h = torch.zeros(1, 1, 64)
+        h = torch.randn(1, 4, 64)
         loop_dim = 8
         out = loop_index_embedding(h, loop_t=3, loop_dim=loop_dim)
-        # channels beyond loop_dim should be unchanged (still 0)
-        assert torch.all(out[..., loop_dim:] == 0)
+        # channels beyond loop_dim are left untouched (depth-invariant subspace)
+        assert torch.allclose(out[..., loop_dim:], h[..., loop_dim:])
+
+    def test_additive_mode(self):
+        # Additive mode still shifts a zero input (Universal-Transformer style).
+        h = torch.zeros(1, 1, 64)
+        out0 = loop_index_embedding(h, loop_t=0, loop_dim=8, mode="additive")
+        out1 = loop_index_embedding(h, loop_t=1, loop_dim=8, mode="additive")
+        assert not torch.allclose(out0, out1)
+        assert torch.all(out0[..., 8:] == 0)
 
 
 # ---------------------------------------------------------------------------
@@ -526,20 +554,23 @@ class TestRecurrentBlock:
     def test_output_shape(self):
         h = torch.randn(B, T, self.cfg.dim)
         e = torch.randn(B, T, self.cfg.dim)
-        out = self.block(h, e, self.freqs)
+        # RecurrentBlock returns (hidden_state, router_z_loss)
+        out, aux = self.block(h, e, self.freqs)
         assert out.shape == (B, T, self.cfg.dim)
+        # in training mode the router z-loss is a finite scalar
+        assert aux is not None and aux.ndim == 0 and torch.isfinite(aux)
 
     def test_more_loops_changes_output(self):
         h = torch.randn(B, T, self.cfg.dim)
         e = torch.randn(B, T, self.cfg.dim)
-        out1 = self.block(h.clone(), e.clone(), self.freqs, n_loops=1)
-        out3 = self.block(h.clone(), e.clone(), self.freqs, n_loops=3)
+        out1, _ = self.block(h.clone(), e.clone(), self.freqs, n_loops=1)
+        out3, _ = self.block(h.clone(), e.clone(), self.freqs, n_loops=3)
         assert not torch.allclose(out1, out3)
 
     def test_single_loop_runs(self):
         h = torch.randn(B, T, self.cfg.dim)
         e = torch.randn(B, T, self.cfg.dim)
-        out = self.block(h, e, self.freqs, n_loops=1)
+        out, _ = self.block(h, e, self.freqs, n_loops=1)
         assert out.shape == (B, T, self.cfg.dim)
 
 
