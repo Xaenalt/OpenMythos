@@ -428,3 +428,8 @@ flycheck_*.el
 # network security
 /network-security.data
 
+
+# OpenMythos attention-sweep artifacts
+variant_sweep*.json
+variant_sweep_ckpts/
+*.pt
