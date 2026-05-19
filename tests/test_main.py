@@ -705,5 +705,81 @@ class TestAttnTypeSwap:
         assert cache_bytes(cache_mla) < cache_bytes(cache_gqa)
 
 
+# ---------------------------------------------------------------------------
+# Soma prototype attentions — signed (exc/inhib) and non-linear gating
+# ---------------------------------------------------------------------------
+
+
+class TestSomaAttention:
+    @pytest.mark.parametrize(
+        "attn_type",
+        ["mha", "sigmoid", "tanh", "signed", "signed-plus", "signed-sigmoid", "gated"],
+    )
+    def test_registered_and_builds(self, attn_type):
+        from open_mythos.main import ATTENTION_REGISTRY, build_attention, AttentionBase
+
+        assert attn_type in ATTENTION_REGISTRY
+        attn = build_attention(gqa_cfg(attn_type=attn_type))
+        assert isinstance(attn, AttentionBase)
+        assert isinstance(attn.wo, torch.nn.Linear)  # residual-init contract
+
+    @pytest.mark.parametrize(
+        "attn_type",
+        ["mha", "sigmoid", "tanh", "signed", "signed-plus", "signed-sigmoid", "gated"],
+    )
+    def test_model_forward_and_generate(self, attn_type):
+        cfg = gqa_cfg(attn_type=attn_type)
+        model = OpenMythos(cfg).eval()
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        with torch.no_grad():
+            logits = model(ids, n_loops=3)
+            out = model.generate(ids, max_new_tokens=4, n_loops=4)
+        assert logits.shape == (B, T, cfg.vocab_size)
+        assert not torch.isnan(logits).any()
+        assert out.shape == (B, T + 4)
+
+    def test_signed_inhibition_changes_output(self):
+        # driving the per-head inhibition gain must move the output — i.e. the
+        # inhibitory pathway is actually wired in, not dead weight
+        cfg = gqa_cfg(attn_type="signed")
+        model = OpenMythos(cfg).eval()
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        with torch.no_grad():
+            base = model(ids, n_loops=3)
+            for m in model.modules():
+                if hasattr(m, "inhib_gain"):
+                    m.inhib_gain.fill_(8.0)  # γ = sigmoid(8) ≈ 1
+            shifted = model(ids, n_loops=3)
+        assert not torch.allclose(base, shifted)
+
+    def test_signed_plus_is_additive_control(self):
+        # signed-plus must be param/shape-identical to signed (only the
+        # combination sign differs) — that's what makes it a clean control
+        from open_mythos.main import build_attention
+
+        sp = {n: p.shape for n, p in build_attention(
+            gqa_cfg(attn_type="signed-plus")).named_parameters()}
+        sg = {n: p.shape for n, p in build_attention(
+            gqa_cfg(attn_type="signed")).named_parameters()}
+        assert sp == sg
+
+    def test_signed_sigmoid_trains(self):
+        # the sigmoid-map E/I variant trains and routes gradient end to end
+        cfg = gqa_cfg(attn_type="signed-sigmoid")
+        model = OpenMythos(cfg)
+        model.train()
+        ids = torch.randint(0, cfg.vocab_size, (B, T))
+        logits, aux = model(ids, n_loops=3, return_aux=True)
+        loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, cfg.vocab_size),
+            torch.randint(0, cfg.vocab_size, (B * T,)),
+        )
+        (loss + aux).backward()
+        assert all(
+            p.grad is not None and torch.isfinite(p.grad).all()
+            for p in model.recurrent.block.attn.parameters()
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "--verbose"])

@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -195,11 +196,75 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Attention registry
+# ---------------------------------------------------------------------------
+
+
+ATTENTION_REGISTRY: dict = {}
+
+
+def register_attention(name: str):
+    """
+    Class decorator registering an attention implementation under `name`.
+
+    Once registered, the variant is selectable by setting cfg.attn_type=name;
+    TransformerBlock builds it through build_attention. The registry is the
+    single seam for adding a new attention mechanism — no other file changes.
+    """
+
+    def _register(cls):
+        ATTENTION_REGISTRY[name] = cls
+        return cls
+
+    return _register
+
+
+class AttentionBase(nn.Module):
+    """
+    Common interface for OpenMythos attention variants.
+
+    Every variant is constructed from a MythosConfig and implements:
+
+        forward(x, freqs_cis, mask, kv_cache=None, cache_key="default") -> Tensor
+
+    with x and the return both shaped (B, T, dim). RoPE frequencies are passed
+    in (the model owns the precomputed buffer); mask is an additive causal mask
+    or None; kv_cache, when given, is a dict mutated in place for incremental
+    decoding and keyed by cache_key.
+
+    Contract: a variant must expose its residual-writing output projection as
+    `self.wo` (an nn.Linear) so the model's residual-scaled initialization can
+    locate it. Register concrete variants with @register_attention("name").
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[dict] = None,
+        cache_key: str = "default",
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+
+def build_attention(cfg: MythosConfig) -> AttentionBase:
+    """Construct the attention module named by cfg.attn_type."""
+    if cfg.attn_type not in ATTENTION_REGISTRY:
+        raise ValueError(
+            f"unknown attn_type {cfg.attn_type!r}; "
+            f"registered: {sorted(ATTENTION_REGISTRY)}"
+        )
+    return ATTENTION_REGISTRY[cfg.attn_type](cfg)
+
+
+# ---------------------------------------------------------------------------
 # Grouped Query Attention with KV cache
 # ---------------------------------------------------------------------------
 
 
-class GQAttention(nn.Module):
+@register_attention("gqa")
+class GQAttention(AttentionBase):
     """
     Grouped Query Attention (Ainslie et al., 2023) with Flash Attention 2 (Dao et al., 2023).
 
@@ -307,7 +372,8 @@ class GQAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class MLAttention(nn.Module):
+@register_attention("mla")
+class MLAttention(AttentionBase):
     """
     Multi-Latent Attention (DeepSeek-V2, 2024).
 
@@ -448,6 +514,348 @@ class MLAttention(nn.Module):
         )  # (B, H, T, v_head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
+
+
+# ---------------------------------------------------------------------------
+# Soma prototype attentions — excitation/inhibition and non-linear gating
+# ---------------------------------------------------------------------------
+
+
+def _elementwise_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    bias: torch.Tensor,
+    dropout_p: float,
+    kind: str,
+) -> torch.Tensor:
+    """
+    Unnormalised elementwise attention — each key's weight is an independent
+    activation of (score + bias), with no softmax normalisation across keys.
+
+      kind="sigmoid"  weight = σ(s + b) ∈ (0, 1)   — sigmoid attention
+                      (Ramapuram et al., 2024); attend to many keys, few, or
+                      none. A learned, typically negative per-head bias keeps
+                      the (unnormalised) initial attention mass small.
+      kind="tanh"     weight = tanh(s + b) ∈ (−1, 1) — *signed* elementwise
+                      attention; a key can be excitatory (w > 0) or inhibitory
+                      (w < 0) independently, so one map carries both mass
+                      freedom and negation.
+
+    Causal masking differs by kind: σ(−inf) = 0, so the sigmoid path can add
+    the −inf mask to the scores; tanh(−inf) = −1 would wrongly give future keys
+    a strong inhibitory weight, so the tanh path zeroes future weights *after*
+    the activation.
+
+    Args:
+        q, k, v   -- (B, H, T, d) / (B, H, S, d) attention tensors
+        mask      -- additive causal mask or None
+        bias      -- per-head bias of shape (H,)
+        dropout_p -- attention dropout (0 disables)
+        kind      -- "sigmoid" or "tanh"
+    """
+    scores = torch.matmul(q, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+    b = bias.view(1, -1, 1, 1)
+    if kind == "sigmoid":
+        if mask is not None:
+            scores = scores + mask  # σ(−inf) = 0 → causal
+        w = torch.sigmoid(scores + b)
+    else:  # tanh — signed weights; zero future positions after the activation
+        w = torch.tanh(scores + b)
+        if mask is not None:
+            w = w.masked_fill(mask < 0, 0.0)
+    if dropout_p > 0.0:
+        w = F.dropout(w, dropout_p)
+    return torch.matmul(w, v)
+
+
+@register_attention("mha")
+class MHAttention(AttentionBase):
+    """
+    Standard full multi-head attention — the plain reference baseline.
+
+    Every head has its own K/V (no GQA grouping). `score_fn` selects the score
+    map: "softmax" (fused SDPA) for the "mha" baseline, "sigmoid" for the
+    "sigmoid" variant, or "tanh" for the signed-elementwise "tanh" variant. A
+    Soma variant's delta against "mha" reflects the mechanism, not a
+    KV-head-count or grouping difference.
+    """
+
+    score_fn: str = "softmax"  # "softmax" (fused SDPA) | "sigmoid" | "tanh"
+
+    def __init__(self, cfg: MythosConfig):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.dim // cfg.n_heads
+        h = self.n_heads * self.head_dim
+        self.wq = nn.Linear(cfg.dim, h, bias=False)
+        self.wk = nn.Linear(cfg.dim, h, bias=False)
+        self.wv = nn.Linear(cfg.dim, h, bias=False)
+        self.wo = nn.Linear(h, cfg.dim, bias=False)
+        self.dropout_p = cfg.dropout
+        if self.score_fn in ("sigmoid", "tanh"):
+            # sigmoid: a negative bias keeps initial (unnormalised) mass small.
+            # tanh: a zero bias starts excitation/inhibition balanced.
+            init = -math.log(cfg.max_seq_len) if self.score_fn == "sigmoid" else 0.0
+            self.attn_bias = nn.Parameter(torch.full((cfg.n_heads,), init))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[dict] = None,
+        cache_key: str = "default",
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, d = self.n_heads, self.head_dim
+        q = apply_rope(self.wq(x).view(B, T, H, d), freqs_cis)
+        k = apply_rope(self.wk(x).view(B, T, H, d), freqs_cis)
+        v = self.wv(x).view(B, T, H, d)
+        if kv_cache is not None:
+            if cache_key in kv_cache:
+                c = kv_cache[cache_key]
+                k = torch.cat([c["k"], k], dim=1)
+                v = torch.cat([c["v"], v], dim=1)
+            kv_cache[cache_key] = {"k": k.detach(), "v": v.detach()}
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+        drop = self.dropout_p if self.training else 0.0
+        if self.score_fn == "softmax":
+            o = F.scaled_dot_product_attention(
+                q, k, v, is_causal=(mask is not None), dropout_p=drop
+            )
+        else:
+            o = _elementwise_attention(
+                q, k, v, mask, self.attn_bias, drop, self.score_fn
+            )
+        return self.wo(o.transpose(1, 2).contiguous().view(B, T, -1))
+
+
+@register_attention("sigmoid")
+class SigmoidAttention(MHAttention):
+    """
+    Plain multi-head sigmoid attention — MHAttention with sigmoid score maps
+    instead of softmax. The reference point for whether sigmoid attention helps
+    or hurts on its own, separate from the excitation/inhibition combination
+    ("signed-sigmoid").
+    """
+
+    score_fn = "sigmoid"
+
+
+@register_attention("tanh")
+class TanhAttention(MHAttention):
+    """
+    Signed elementwise attention — MHAttention with a tanh score map.
+
+    Each key's weight is an independent tanh(score + bias) ∈ (−1, 1): unlike
+    sigmoid (weights ≥ 0) or softmax (a convex combination), a single map can
+    both attend (w > 0) and inhibit (w < 0) per key. This unifies sigmoid's
+    total-mass freedom and excitation/inhibition's negation in *one* map —
+    without the noisy two-map subtraction that made "signed-sigmoid"
+    degenerate. Signed weights also partially self-cancel, so the unnormalised
+    sum is more magnitude-stable than all-positive sigmoid attention.
+    """
+
+    score_fn = "tanh"
+
+
+@register_attention("signed")
+class SignedAttention(AttentionBase):
+    """
+    Signed (excitation − inhibition) attention — the Soma E/I prototype.
+
+    Standard softmax attention forms a convex combination of values: every
+    output lies inside the convex hull of {v_j}, so it can average and copy but
+    never *subtract* a value direction. SignedAttention adds an inhibitory
+    pathway — a second, independent score map combined with a sign:
+
+        out_i = Σ_j a^e_ij v_j  +  s · γ_h · Σ_j a^i_ij v_j
+
+    where s = inhib_sign. The two maps share the value projection but have
+    independent query/key projections; γ_h is a per-head learned gain (sigmoid
+    of a parameter, 0.5 at init).
+
+    Three registered variants share this implementation:
+      - "signed"         s = −1, softmax maps  — true excitation/inhibition
+      - "signed-plus"    s = +1, softmax maps  — additive control: identical
+                         params and compute, only the sign flips, so
+                         signed-vs-plus isolates whether the *subtraction*
+                         (genuine inhibition) is what helps vs a second map
+      - "signed-sigmoid" s = −1, sigmoid maps  — independent (0,1) weights per
+                         key, no cross-key normalisation
+
+    Full multi-head (no GQA grouping): a mechanism prototype, not a
+    KV-efficiency one.
+    """
+
+    inhib_sign: float = -1.0  # −1 inhibitory (subtract); +1 additive control
+    score_fn: str = "softmax"  # "softmax" (fused SDPA) | "sigmoid" (manual)
+
+    def __init__(self, cfg: MythosConfig):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.dim // cfg.n_heads
+        h = self.n_heads * self.head_dim
+        # excitatory and inhibitory query/key projections; the value path is shared
+        self.wq_e = nn.Linear(cfg.dim, h, bias=False)
+        self.wk_e = nn.Linear(cfg.dim, h, bias=False)
+        self.wq_i = nn.Linear(cfg.dim, h, bias=False)
+        self.wk_i = nn.Linear(cfg.dim, h, bias=False)
+        self.wv = nn.Linear(cfg.dim, h, bias=False)
+        self.wo = nn.Linear(h, cfg.dim, bias=False)
+        # per-head inhibition gain γ_h = sigmoid(inhib_gain); init 0 → γ = 0.5
+        self.inhib_gain = nn.Parameter(torch.zeros(cfg.n_heads))
+        self.dropout_p = cfg.dropout
+        # sigmoid attention has no cross-key normalisation, so output mass would
+        # grow with sequence length — a learned negative per-head bias keeps the
+        # initial attention mass small (the −log(L) heuristic).
+        if self.score_fn == "sigmoid":
+            self.attn_bias = nn.Parameter(
+                torch.full((cfg.n_heads,), -math.log(cfg.max_seq_len))
+            )
+
+    def _attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """One attention map — fused softmax SDPA, or a manual sigmoid map."""
+        drop = self.dropout_p if self.training else 0.0
+        if self.score_fn == "sigmoid":
+            return _elementwise_attention(
+                q, k, v, mask, self.attn_bias, drop, "sigmoid"
+            )
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=(mask is not None), dropout_p=drop
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[dict] = None,
+        cache_key: str = "default",
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, d = self.n_heads, self.head_dim
+        qe = apply_rope(self.wq_e(x).view(B, T, H, d), freqs_cis)
+        ke = apply_rope(self.wk_e(x).view(B, T, H, d), freqs_cis)
+        qi = apply_rope(self.wq_i(x).view(B, T, H, d), freqs_cis)
+        ki = apply_rope(self.wk_i(x).view(B, T, H, d), freqs_cis)
+        v = self.wv(x).view(B, T, H, d)
+
+        if kv_cache is not None:
+            if cache_key in kv_cache:
+                c = kv_cache[cache_key]
+                ke = torch.cat([c["ke"], ke], dim=1)
+                ki = torch.cat([c["ki"], ki], dim=1)
+                v = torch.cat([c["v"], v], dim=1)
+            kv_cache[cache_key] = {
+                "ke": ke.detach(),
+                "ki": ki.detach(),
+                "v": v.detach(),
+            }
+
+        qe, ke, qi, ki, vt = (t.transpose(1, 2) for t in (qe, ke, qi, ki, v))
+        o_e = self._attend(qe, ke, vt, mask)
+        o_i = self._attend(qi, ki, vt, mask)
+        gamma = torch.sigmoid(self.inhib_gain).view(1, H, 1, 1)
+        o = o_e + self.inhib_sign * gamma * o_i  # excitation ± gated inhibition
+        o = o.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.wo(o)
+
+
+@register_attention("signed-plus")
+class SignedPlusAttention(SignedAttention):
+    """
+    Additive control for SignedAttention: out = o_e + γ·o_i (excitation plus a
+    second softmax map). Identical params and compute to "signed" — only the
+    combination sign flips. signed vs signed-plus isolates whether genuine
+    inhibition (the subtraction) helps, or merely having a second attention map.
+    """
+
+    inhib_sign = +1.0
+
+
+@register_attention("signed-sigmoid")
+class SignedSigmoidAttention(SignedAttention):
+    """
+    SignedAttention with sigmoid attention maps instead of softmax: each key's
+    weight is an independent σ(·) in (0, 1) with no cross-key normalisation,
+    layered on the excitation/inhibition combination.
+    """
+
+    score_fn = "sigmoid"
+
+
+@register_attention("gated")
+class GatedAttention(AttentionBase):
+    """
+    Non-linear value-gated attention — a Soma prototype.
+
+    Standard attention is linear in the values: out = Σ_j a_ij v_j, then wo(out).
+    GatedAttention keeps an ordinary softmax score map but passes the attended
+    output through a SwiGLU-style gate conditioned on the query token's own
+    representation, before the output projection:
+
+        out_i = wo( attn_i ⊙ silu(W_g x_i) )
+
+    The gate lets each token non-linearly modulate its attended signal —
+    suppressing or amplifying channels from its own state — adding expressiveness
+    in the value-aggregation path rather than in the score map.
+
+    Full multi-head; the attention itself runs as a fused SDPA call.
+    """
+
+    def __init__(self, cfg: MythosConfig):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.dim // cfg.n_heads
+        h = self.n_heads * self.head_dim
+        self.wq = nn.Linear(cfg.dim, h, bias=False)
+        self.wk = nn.Linear(cfg.dim, h, bias=False)
+        self.wv = nn.Linear(cfg.dim, h, bias=False)
+        self.wg = nn.Linear(cfg.dim, h, bias=False)  # non-linear output gate
+        self.wo = nn.Linear(h, cfg.dim, bias=False)
+        self.dropout_p = cfg.dropout
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[dict] = None,
+        cache_key: str = "default",
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+        H, d = self.n_heads, self.head_dim
+        q = apply_rope(self.wq(x).view(B, T, H, d), freqs_cis)
+        k = apply_rope(self.wk(x).view(B, T, H, d), freqs_cis)
+        v = self.wv(x).view(B, T, H, d)
+
+        if kv_cache is not None:
+            if cache_key in kv_cache:
+                c = kv_cache[cache_key]
+                k = torch.cat([c["k"], k], dim=1)
+                v = torch.cat([c["v"], v], dim=1)
+            kv_cache[cache_key] = {"k": k.detach(), "v": v.detach()}
+
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+        o = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            is_causal=(mask is not None),
+            dropout_p=self.dropout_p if self.training else 0.0,
+        )
+        o = o.transpose(1, 2).contiguous().view(B, T, -1)
+        o = o * F.silu(self.wg(x))  # non-linear gate on the attended output
+        return self.wo(o)
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +1237,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm(cfg.dim)
         self.ffn_norm = RMSNorm(cfg.dim)
-        self.attn = MLAttention(cfg) if cfg.attn_type == "mla" else GQAttention(cfg)
+        self.attn = build_attention(cfg)
         self.ffn = MoEFFN(cfg) if use_moe else Expert(cfg.dim, cfg.dim * 4 // 3)
         self.resid_drop = nn.Dropout(cfg.dropout)
 
@@ -1230,7 +1638,7 @@ class OpenMythos(nn.Module):
         resid_scale = (2 * depth) ** -0.5
         with torch.no_grad():
             for m in self.modules():
-                if isinstance(m, (MLAttention, GQAttention)):
+                if isinstance(m, AttentionBase):
                     m.wo.weight.mul_(resid_scale)
                 elif isinstance(m, Expert):
                     # dense prelude/coda FFN and MoE shared experts
