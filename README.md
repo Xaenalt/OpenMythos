@@ -32,6 +32,130 @@
 OpenMythos is an open-source, theoretical implementation of the Claude Mythos model. It implements a Recurrent-Depth Transformer (RDT) with three stages: **Prelude** (transformer blocks), a looped **Recurrent Block** (up to `max_loop_iters`), and a final **Coda**. Attention is switchable between MLA and GQA, and the feed-forward uses a sparse MoE with routed and shared experts ideal for exploring compute-adaptive, depth-variable reasoning.
 
 
+## SOTA-hardening fork
+
+This fork hardens the upstream reconstruction toward a training base you can
+actually run, and adds a pluggable attention layer for mechanism research. The
+changes are grouped into three commits on top of upstream so they can be read
+independently.
+
+### Training-correctness and speed hardening
+
+The original implementation was architecturally faithful but missing the
+machinery a real pre-training run needs. This commit adds:
+
+- **Gradient checkpointing** on transformer/recurrent blocks (`cfg.grad_checkpoint`),
+  so depth-variable models fit in memory at useful batch sizes.
+- **Weight-decay parameter groups** — norms, biases, and embeddings are excluded
+  from decay; only matmul weights are regularized. This is standard in every
+  modern LLM recipe and materially affects convergence.
+- **GPT-2-style scaled residual init** — output projections are scaled by
+  `1/sqrt(2 * n_layers)` so residual variance does not grow with depth. With a
+  *looped* recurrent block this matters more than usual, since the same block is
+  re-applied many times.
+- **Router z-loss and ACT ponder cost** are surfaced through the loss as an
+  auxiliary term (`return_aux=True`), and the MoE router bias is updated with an
+  aux-loss-free load-balancing step (`step_router_bias()`), matching the
+  DeepSeek-style balancing the architecture was designed around.
+- **Real-valued RoPE** — RoPE is recomputed with explicit `cos`/`sin` tensors
+  instead of complex arithmetic, because `torch.compile` (Inductor) cannot
+  codegen complex ops. Combined with fused SDPA and `torch.compile`, this makes
+  the model compile cleanly and run at competitive throughput.
+- **`use_orig_params=True`** so the param-group split survives FSDP wrapping.
+
+None of this changes the architecture — it makes the existing architecture
+trainable to SOTA-style standards.
+
+### Pluggable attention registry and mechanism-research variants
+
+Attention is refactored behind an `AttentionBase` interface with a
+`@register_attention` decorator and a `build_attention()` factory, so a model
+can be instantiated with any registered mechanism by name. Alongside the
+original MLA/GQA this fork ships an MHA baseline and a family of research
+variants exploring **excitation/inhibition** score maps — `signed`,
+`signed-plus`, `signed-sigmoid`, `sigmoid`, `tanh`, and a SwiGLU-`gated`
+variant. These let the same model be used as a controlled testbed for attention
+mechanisms rather than being locked to one.
+
+### Attention-variant sweep and instrumentation
+
+`tests/variant_sweep.py` runs deterministic, identical-batch comparisons across
+mechanisms with domain and learning-rate presets; `tests/analyze_attention.py`
+inspects trained checkpoints — learned inhibition gain and attention-map
+structure. Together they make the model a controlled testbed for attention
+research. These are research tools rather than a benchmark; what wins depends
+on data, scale, and recipe, so run them on your own setup and draw your own
+conclusions. See [Adding an attention mechanism](#adding-an-attention-mechanism)
+and [Running the analysis scripts](#running-the-analysis-scripts) below.
+
+### Adding an attention mechanism
+
+Every attention variant is a small `nn.Module` registered by name; a model
+picks its mechanism with `cfg.attn_type` and nothing else changes. To add one:
+
+1. Subclass `AttentionBase` (or an existing variant), implementing
+   `forward(x, freqs_cis, mask, kv_cache=None, cache_key="default")` with `x`
+   and the return both shaped `(B, T, dim)`.
+2. Expose the residual-writing output projection as `self.wo` (an `nn.Linear`)
+   so the model's residual-scaled initialization can find it.
+3. Decorate the class with `@register_attention("my-attn")`.
+
+The shipped variants are the template. The simplest live inside one score-map
+family — `SigmoidAttention` and `TanhAttention` are just `MHAttention`
+subclasses that set `score_fn`:
+
+```python
+from open_mythos.main import MHAttention, register_attention
+
+@register_attention("my-attn")
+class MyAttention(MHAttention):
+    """A new score map; see SignedAttention for a full-rewrite example."""
+    score_fn = "my-score"
+```
+
+Once registered, select it anywhere a config is built:
+
+```python
+cfg = MythosConfig(attn_type="my-attn", ...)
+model = OpenMythos(cfg)            # build_attention(cfg) resolves the name
+```
+
+`build_attention` raises with the list of registered names if `attn_type` is
+unknown. For a mechanism that is not a drop-in score map — its own Q/K/V
+shapes, two score maps, and so on — subclass `AttentionBase` directly;
+`SignedAttention` is the worked example.
+
+### Running the analysis scripts
+
+**Sweep** — train several variants under an identical recipe on identical
+batches, then compare. Presets live in the `SWEEPS` dict at the top of the
+script (`ei`, `sigmoid`, `domains`, `attention`):
+
+```bash
+python tests/variant_sweep.py --sweep attention --steps 9000 \
+    --dataset roneneldan/TinyStories --out variant_sweep_results.json \
+    --ckpt-dir variant_sweep_ckpts
+```
+
+Per-variant final eval losses are written to `--out` as JSON; runs are
+deterministic, so a variant's number is reproducible across invocations. Useful
+knobs: `--dim`, `--loops`, `--lr`, `--steps`, `--dataset`/`--dataset-config`,
+and `--ckpt-dir` to save per-variant checkpoints for the next step.
+
+**Instrumentation** — inspect what the trained attention layers learned, from
+the checkpoints a sweep saved. `--sweep` here is the checkpoint filename prefix
+(it matches the sweep that produced them):
+
+```bash
+python tests/analyze_attention.py --ckpt-dir variant_sweep_ckpts --sweep sigmoid
+```
+
+It reports, per attention layer, the learned inhibition gain γ (for E/I
+variants) and attention-map structure — effective key count, total attended
+mass, and excitation/inhibition overlap — so you can see *how* a mechanism
+behaves, not just what its loss did.
+
+
 ## Installation
 
 ```bash
